@@ -21,16 +21,19 @@ def verbose_print(message):
 
 def output_displacement(displacement_value):
     """Output displacement value in either JSON or regular format."""
+    formatted_value = f"{displacement_value:.3f}"  # Ensures 3 decimal places
+
     if JSON_MODE:
         # Output in JSON format
         output = {
-            "displacement": displacement_value,
+            "displacement": float(formatted_value),
             "unit": "mm"
         }
         print(json.dumps(output))
     else:
         # Regular format output
-        print(f"Displacement: {displacement_value} mm")
+        print(f"{formatted_value} mm")
+
 
 
 def read_displacement(client, slave_id):
@@ -47,22 +50,16 @@ def read_displacement(client, slave_id):
 
         # Ensure you have received 2 registers (4 bytes)
         if len(response.registers) == 2:
-            # Combine the two 16-bit registers into a 32-bit value
-            high_register = response.registers[0]
-            low_register = response.registers[1]
-
-            # Manually combine the two 16-bit registers into a single 32-bit integer
-            combined_value = (high_register << 16) | low_register
-
             # Extract the sign bit from the high byte (first byte of the high register)
-            sign_bit = (high_register & 0xFF00) >> 8
+            sign_bit = (response.registers[0] & 0xFF00) >> 8
+            # Combine the two 16-bit registers into a 32-bit value
+            value = response.registers[1]
 
             # If the sign bit is 1, the value is negative
             if sign_bit == 1:
-                combined_value = -combined_value
+                value = -value
 
-            # Convert value to a readable format (example based on protocol conversion to millimeters)
-            displacement_value = combined_value / 10000.0  # Assuming high precision (4 decimal places)
+            displacement_value = value / 1000.0  # value is in microns, we output it in mm
             
             # Output the displacement in either JSON or regular format
             output_displacement(displacement_value)
