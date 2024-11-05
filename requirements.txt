@@ -1,3 +1,9 @@
+argparse
+signal
+sys
+json
+asyncio
 pymodbus
 pyserial
 bleak
+datetime
