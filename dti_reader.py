@@ -15,13 +15,18 @@ VERBOSE_MODE = False
 JSON_MODE = False
 CHARACTERISTIC_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"
 INFINITE_RUN_TIME = 100 * 365.25 * 24 * 60 * 60  # 100 years in seconds
-DISCONNECTED = False  # Track the connection status
 
 
 def verbose_print(message):
     """Print verbose messages if verbose mode is enabled."""
     if VERBOSE_MODE:
         print(f"{message}", file=sys.stderr)
+
+
+def error_message(message):
+    """Print error messages to stderr."""
+    print(f"Error: {message}", file=sys.stderr)
+
 
 def output_displacement(displacement_value):
     """Output displacement value in either JSON or regular format."""
@@ -44,12 +49,7 @@ def output_displacement(displacement_value):
 
 
 def process_displacement_data(data_bytes, sign_bit):
-    """
-    Common function to process displacement data from Bluetooth and RS232.
-
-    :param data_bytes: 3 bytes representing the displacement value
-    :param sign_bit: The sign byte (1 means negative, 0 means positive)
-    """
+    """Common function to process displacement data from Bluetooth and RS232."""
     # Combine the 3 bytes (big-endian) to create the full 24-bit value
     value = int.from_bytes(data_bytes, byteorder="big")
 
@@ -62,94 +62,89 @@ def process_displacement_data(data_bytes, sign_bit):
     output_displacement(displacement_value)
 
 
-# RS232 (Modbus) Functions
-def read_displacement_rs232(client, slave_id):
-    """Function to read displacement from the RS232 device."""
-    address = 0x0000  # Starting address
-    count = 2         # Reading 2 registers (4 bytes total)
+class BluetoothDisplacementReader:
+    def __init__(self, device_address, period=None, deadman=None):
+        self.device_address = device_address
+        self.period = period
+        self.deadman_timeout = deadman
+        self.disconnected = False
+        self.deadman = asyncio.Event()  # Event to manage the deadman timer
+        self.timer_task = None  # Task for the resettable timer
 
-    # Send the read holding registers command
-    response = client.read_holding_registers(address=address, count=count, slave=slave_id)
-
-    if not response.isError():
-        verbose_print(f"Raw register data (RS232): {response.registers}")
-        # Ensure we have received 2 registers (4 bytes)
-        if len(response.registers) == 2:
-            # Extract the sign bit from the high byte (first byte of the high register)
-            sign_bit = (response.registers[0] & 0xFF00) >> 8
-            # Extract the 3 value bytes: last byte of the first register and two bytes of the second register
-            value_bytes = [
-                response.registers[0] & 0x00FF,  # Low byte from the first register
-                (response.registers[1] & 0xFF00) >> 8,  # High byte from the second register
-                response.registers[1] & 0x00FF  # Low byte from the second register
-            ]
+    async def handle_notification(self, sender: int, data: bytearray):
+        """Callback function to process incoming BLE notifications."""
+        self.reset_timer()  # Reset the timer whenever a notification is received
+        verbose_print(f"Raw data (Bluetooth): {':'.join(f'{byte:02X}' for byte in data)}")
+        if len(data) >= 8:
+            sign_bit = data[-1]  # Extract the sign bit from the last byte
+            value_bytes = data[-4:-1]  # Extract the previous 3 bytes as the value
             process_displacement_data(value_bytes, sign_bit)
-        else:
-            verbose_print("Unexpected number of registers returned.")
-    else:
-        verbose_print("Failed to read displacement sensor data.")
 
+    def reset_timer(self):
+        """Reset the timer by canceling the existing one and starting a new one."""
+        if self.timer_task:
+            self.timer_task.cancel()  # Cancel the existing timer task
+        self.deadman.clear()  # Clear the event
+        self.timer_task = asyncio.create_task(self.start_timer())  # Start a new timer
 
-# Bluetooth (BLE) Functions
-def handle_notification(sender: int, data: bytearray):
-    """Callback function to process incoming BLE notifications."""
-    # Print raw data for debugging in verbose mode
-    verbose_print(f"Raw data (Bluetooth): {':'.join(f'{byte:02X}' for byte in data)}")
-
-    if len(data) >= 8:
-        # Extract the sign bit from the last byte
-        sign_bit = data[-1]
-        # Extract the previous 3 bytes as the value
-        value_bytes = data[-4:-1]
-        process_displacement_data(value_bytes, sign_bit)
-
-
-async def read_displacement_bt(device_address, period=None):
-    """Function to read displacement from the Bluetooth device."""
-    global DISCONNECTED
-    max_retries = 5  # Set a limit to how many times to retry
-    retry_count = 0
-
-    while retry_count < max_retries and not DISCONNECTED:
+    async def start_timer(self):
+        """Start the timer and set the event when the deadman timeout expires."""
         try:
-            async with BleakClient(device_address) as client:
-                verbose_print(f"Connected: {client.is_connected}")
-                await client.start_notify(CHARACTERISTIC_UUID, handle_notification)
-                verbose_print("Subscribed to notifications. Waiting for updates...")
+            await asyncio.sleep(self.deadman_timeout)  # Wait for the deadman timeout
+            verbose_print("Deadman timeout reached, reconnecting...")
+            self.deadman.set()  # Set the event to signal timeout
+        except asyncio.CancelledError:
+            pass  # Timer was reset
 
-                # Keep connection open indefinitely or for the specified period
-                try:
-                    if period:
-                        await asyncio.sleep(period)  # Sleep for the defined period
-                    else:
-                        await asyncio.sleep(INFINITE_RUN_TIME)  # Simulate infinite run (100 years)
-                except asyncio.CancelledError:
-                    verbose_print("Notification listening was cancelled.")
-                finally:
-                    if not DISCONNECTED:
+    async def read_displacement(self):
+        """Function to read displacement from the Bluetooth device."""
+        max_retries = 5  # Set a limit to how many times to retry
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                async with BleakClient(self.device_address) as client:
+                    verbose_print(f"Connected: {client.is_connected}")
+                    self.disconnected = False
+                    self.deadman.clear()  # Clear the event at the start of the connection
+
+                    await client.start_notify(
+                        CHARACTERISTIC_UUID,
+                        self.handle_notification
+                    )
+                    verbose_print("Subscribed to notifications. Waiting for updates...")
+
+                    # Loop to wait for either a deadman timeout or the period to elapse
+                    try:
+                        # Wait for the deadman event to be set or for the period to elapse
+                        wait_duration = self.period if self.period else INFINITE_RUN_TIME
+                        await asyncio.wait_for(self.deadman.wait(), timeout=wait_duration)
+                        if self.deadman.is_set():
+                            verbose_print("Deadman timeout reached. Reconnecting...")
+#                            break  # Break the loop to trigger a reconnection
+                    except asyncio.TimeoutError:
+                        # Period elapsed, exit the loop
+                        verbose_print("Period elapsed. Exiting...")
                         await client.stop_notify(CHARACTERISTIC_UUID)
-                break  # Successfully ran, break out of retry loop
-        except BleakDeviceNotFoundError:
-            print(f"Device with address {device_address} was not found. Exiting.")
-            sys.exit(1)
-        except BleakError as e:
-            retry_count += 1
-            verbose_print(f"Bluetooth connection lost: {e}. Retrying ({retry_count}/{max_retries})...")
-            DISCONNECTED = True  # Mark the device as disconnected
-            await asyncio.sleep(5)  # Wait 5 seconds before retrying
+                        return
 
-    if retry_count >= max_retries:
-        print("Max retries reached. Exiting.")
-        sys.exit(1)
+            except BleakDeviceNotFoundError:
+                error_message(f"Device with address {self.device_address} was not found. Exiting.")
+                sys.exit(1)
+            except BleakError as e:
+                retry_count += 1
+                verbose_print(f"Bluetooth connection lost: {e}. Retrying ({retry_count}/{max_retries})...")
+                await asyncio.sleep(5)  # Wait before retrying
+
+        if retry_count >= max_retries:
+            error_message("Max retries reached. Exiting.")
+            sys.exit(1)
 
 
 def signal_handler(sig, frame):
     """Handle termination signals (e.g., Ctrl+C) gracefully."""
-    global DISCONNECTED
     verbose_print("\nTerminating script.")
-    DISCONNECTED = True  # Set disconnected to prevent further operations
     sys.exit(0)
-
 
 
 def main():
@@ -161,6 +156,7 @@ def main():
     parser.add_argument('--device', type=str, required=True, help="The device file for RS232 or the MAC address for Bluetooth")
     parser.add_argument('--interval', type=float, help="Time interval between RS232 queries in seconds (e.g., 0.5 for 500 ms)")
     parser.add_argument('--period', type=float, help="Run the script for a specified time period in seconds (e.g., 60 for 1 minute)")
+    parser.add_argument('--deadman', type=float, help="Maximum time to wait for an update before reconnecting")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose output")
     parser.add_argument('--json', action='store_true', help="Output the displacement data in JSON format")
     args = parser.parse_args()
@@ -172,17 +168,18 @@ def main():
     # Handle signals (e.g., Ctrl+C)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Choose Bluetooth or RS232 communication based on the --connection argument
+    loop = asyncio.get_event_loop()  # Get the current event loop
+
     if args.connection == 'bt':
         # Bluetooth mode
         verbose_print(f"Starting Bluetooth mode using device {args.device}...")
-        asyncio.run(read_displacement_bt(args.device, args.period))
+        reader = BluetoothDisplacementReader(args.device, args.period, args.deadman)
+        loop.run_until_complete(reader.read_displacement())  # Use the event loop to run the async function
     elif args.connection == 'rs232':
         if not args.interval:
             print("For RS232, --interval is required.")
             sys.exit(1)
 
-        # RS232 mode
         verbose_print(f"Starting RS232 mode on device {args.device} with interval {args.interval} seconds.")
         client = ModbusSerialClient(
             port=args.device,
@@ -193,7 +190,6 @@ def main():
             timeout=1
         )
 
-        # Connect to the RS232 sensor
         if not client.connect():
             print("Failed to connect to the RS232 sensor.")
             sys.exit(1)
@@ -202,14 +198,12 @@ def main():
 
         slave_id = 0x01  # Default Modbus address for the sensor
 
-        # Infinite loop to query RS232 at specified interval
         start_time = time.time()
         try:
             while True:
                 read_displacement_rs232(client, slave_id)
                 time.sleep(args.interval)
 
-                # If period is defined, stop after the period
                 if args.period and time.time() - start_time >= args.period:
                     break
         except KeyboardInterrupt:
